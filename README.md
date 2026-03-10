@@ -1,3 +1,3 @@
 # Yet Another Pong Clock
 
-[text](https://tabascoterrier.github.io/pong-clock/)
+[https://tabascoterrier.github.io/pong-clock/](https://tabascoterrier.github.io/pong-clock/)
