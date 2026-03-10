@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pong Clock</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    background: #000;
+    width: 100%; height: 100%;
+    overflow: hidden;
+  }
+
+  #wrap {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+  }
+
+  canvas {
+    display: block;
+    position: absolute;
+    top: 0; left: 0;
+  }
+
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c"></canvas>
+</div>
+
+<script>
+'use strict';
+
+const C  = document.getElementById('c');
+const X  = C.getContext('2d');
+
+// ── Pixel digit bitmaps (3 cols × 5 rows) ─────────────────────────────────
+const DIGITS = {
+  '0': [1,1,1, 1,0,1, 1,0,1, 1,0,1, 1,1,1],
+  '1': [0,1,0, 0,1,0, 0,1,0, 0,1,0, 0,1,0],
+  '2': [1,1,1, 0,0,1, 1,1,1, 1,0,0, 1,1,1],
+  '3': [1,1,1, 0,0,1, 1,1,1, 0,0,1, 1,1,1],
+  '4': [1,0,1, 1,0,1, 1,1,1, 0,0,1, 0,0,1],
+  '5': [1,1,1, 1,0,0, 1,1,1, 0,0,1, 1,1,1],
+  '6': [1,1,1, 1,0,0, 1,1,1, 1,0,1, 1,1,1],
+  '7': [1,1,1, 0,0,1, 0,0,1, 0,0,1, 0,0,1],
+  '8': [1,1,1, 1,0,1, 1,1,1, 1,0,1, 1,1,1],
+  '9': [1,1,1, 1,0,1, 1,1,1, 0,0,1, 1,1,1],
+};
+
+// ── Phosphor palette ───────────────────────────────────────────────────────
+const P       = '#ffffff';
+const P_TRACE = 'rgba(255,255,255,';  // open for alpha concat
+const BG      = '#000000';
+
+// ── Dimensions (recomputed on resize) ─────────────────────────────────────
+let W, H;
+
+function resize() {
+  W = C.width  = window.innerWidth;
+  H = C.height = window.innerHeight;
+}
+resize();
+
+// ── Layout helpers (all relative so it adapts to any screen) ──────────────
+const PW   = () => Math.max(8,  W * 0.016);       // paddle width
+const PH   = () => Math.max(50, H * 0.18);        // paddle height
+const BR   = () => Math.max(5,  Math.min(W,H) * 0.013); // ball radius
+const PMAR = () => Math.max(18, W * 0.038);       // paddle margin from edge
+const PSPD = () => H * 0.0095;                    // paddle speed px/frame
+const BSPD = () => W * 0.006;                     // ball base speed px/frame
+
+// ── Game state ─────────────────────────────────────────────────────────────
+let ball = { x: 0, y: 0, vx: 0, vy: 0 };
+let lp   = { x: 0, y: 0 };   // left paddle
+let rp   = { x: 0, y: 0 };   // right paddle
+
+//  'none'       – normal rally, both paddles compete
+//  'left_miss'  – left paddle misses → ball exits left  → right (minutes) scores
+//  'right_miss' – right paddle misses → ball exits right → left (hours) scores
+let scoring   = 'none';
+let pending   = [];           // queue: 'minutes' | 'hours'
+let resetTimer = 0;           // frames until next launch
+let flash     = { side: null, t: 0, MAX: 55 };
+
+let trail     = [];           // phosphor trail behind ball
+let lastH     = -1, lastM = -1;
+let missDir   = 1;            // which edge the missing paddle aims past
+
+// ── Displayed score (only updates when ball is actually missed) ────────────
+let displayH, displayM;
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+
+// ── Init ───────────────────────────────────────────────────────────────────
+function placePaddles() {
+  lp.x = PMAR();
+  rp.x = W - PMAR() - PW();
+}
+
+function launchBall(dir) {
+  // Always launch with a meaningful vertical component (20–45°)
+  const deg   = 20 + Math.random() * 25;
+  const angle = deg * (Math.PI / 180);
+  const vSign = Math.random() > 0.5 ? 1 : -1;
+  const spd   = BSPD();
+  ball.x  = W / 2;
+  ball.y  = H / 2 + (Math.random() - 0.5) * H * 0.25;
+  ball.vx = spd * Math.cos(angle) * (dir === 'left' ? -1 : 1);
+  ball.vy = spd * Math.sin(angle) * vSign;
+  trail   = [];
+}
+
+function getNow() {
+  const d = new Date();
+  return { h: d.getHours(), m: d.getMinutes() };
+}
+
+// ── Update ─────────────────────────────────────────────────────────────────
+function update() {
+  placePaddles();
+
+  // ── Time-change detection ───────────────────────────────────────────────
+  const now = getNow();
+  if (lastH < 0) {
+    lastH = now.h;
+    lastM = now.m;
+  } else if (now.m !== lastM) {
+    // Minute incremented
+    // Right score (minutes) increments → left paddle misses → ball exits left
+    pending.push('minutes');
+    lastM = now.m;
+    lastH = now.h;
+  }
+
+  // ── Reset timer ─────────────────────────────────────────────────────────
+  if (resetTimer > 0) {
+    if (--resetTimer === 0) {
+      launchBall(Math.random() > 0.5 ? 'left' : 'right');
+    }
+    if (flash.t > 0) flash.t--;
+    return;
+  }
+
+  // ── Process pending score event ─────────────────────────────────────────
+  if (scoring === 'none' && pending.length > 0) {
+    const evt = pending.shift();
+    missDir = Math.random() > 0.5 ? 1 : -1;   // which edge the ball sneaks past
+    if (evt === 'minutes') {
+      scoring = 'left_miss';
+    } else {
+      scoring = 'right_miss';
+    }
+  }
+
+  if (flash.t > 0) flash.t--;
+
+  // ── Phosphor trail ──────────────────────────────────────────────────────
+  trail.push({ x: ball.x, y: ball.y, age: 0 });
+  if (trail.length > 14) trail.shift();
+  trail.forEach(p => p.age++);
+
+  // ── Move ball ───────────────────────────────────────────────────────────
+  ball.x += ball.vx;
+  ball.y += ball.vy;
+
+  // Wall bounce (top / bottom)
+  const r = BR();
+  if (ball.y - r <= 0)    { ball.y =     r; ball.vy =  Math.abs(ball.vy); }
+  if (ball.y + r >= H)    { ball.y = H - r; ball.vy = -Math.abs(ball.vy); }
+
+  // ── Paddle AI ───────────────────────────────────────────────────────────
+  paddleAI(lp, 'left',  scoring === 'left_miss');
+  paddleAI(rp, 'right', scoring === 'right_miss');
+
+  // ── Ball ↔ paddle collision ─────────────────────────────────────────────
+  if (scoring !== 'left_miss'  && collides(lp, 'left'))   bounce(lp, 'left');
+  if (scoring !== 'right_miss' && collides(rp, 'right'))  bounce(rp, 'right');
+
+  // ── Out of bounds → score ───────────────────────────────────────────────
+  if (ball.x < -r)      triggerScore('right');   // right (minutes) side flash
+  else if (ball.x > W + r) triggerScore('left'); // left  (hours)   side flash
+}
+
+// Simulate ball path to find where it will reach a given paddle face x.
+function predictBallY(faceX, approachDir) {
+  // approachDir: -1 means ball must be heading left, +1 heading right
+  if (Math.sign(ball.vx) !== approachDir) return null; // ball heading away
+  let x = ball.x, y = ball.y, vx = ball.vx, vy = ball.vy;
+  const r = BR();
+  for (let i = 0; i < 1000; i++) {
+    x += vx; y += vy;
+    if (y - r <= 0)  { y = r;     vy =  Math.abs(vy); }
+    if (y + r >= H)  { y = H - r; vy = -Math.abs(vy); }
+    if (approachDir === -1 && x <= faceX) return y;
+    if (approachDir ===  1 && x >= faceX) return y;
+  }
+  return null;
+}
+
+function paddleAI(p, side, miss) {
+  const cy      = p.y + PH() / 2;
+  const spd     = PSPD();
+  const faceX   = side === 'left' ? p.x + PW() : p.x;
+  const dir     = side === 'left' ? -1 : 1;
+
+  let target;
+  if (miss) {
+    // Aim just off — ball sneaks past one edge
+    target = ball.y + missDir * (PH() * 0.6 + BR() * 2);
+  } else {
+    // Predict arrival position; fall back to tracking ball.y if ball is heading away
+    target = predictBallY(faceX, dir) ?? ball.y;
+  }
+
+  if (cy < target - 3) p.y += spd;
+  else if (cy > target + 3) p.y -= spd;
+  p.y = clamp(p.y, 0, H - PH());
+}
+
+function collides(p, side) {
+  const r   = BR();
+  const inY = ball.y + r >= p.y && ball.y - r <= p.y + PH();
+  if (side === 'left') {
+    return ball.vx < 0
+        && ball.x - r <= p.x + PW()
+        && ball.x + r >= p.x
+        && inY;
+  }
+  return ball.vx > 0
+      && ball.x + r >= p.x
+      && ball.x - r <= p.x + PW()
+      && inY;
+}
+
+function bounce(p, side) {
+  const rel  = (ball.y - (p.y + PH() / 2)) / (PH() / 2);
+  const maxY = BSPD() * 2.2;
+
+  if (side === 'left') {
+    ball.vx =  Math.abs(ball.vx);
+    ball.x  = p.x + PW() + BR() + 1;
+  } else {
+    ball.vx = -Math.abs(ball.vx);
+    ball.x  = p.x - BR() - 1;
+  }
+  ball.vy = clamp(rel * BSPD() * 1.8, -maxY, maxY);
+}
+
+function triggerScore(side) {
+  // Increment the displayed score now that the ball was actually missed
+  if (side === 'right') {
+    displayM = (displayM + 1) % 60;   // minutes go up
+    if (displayM === 0) pending.push('hours'); // rolled over — hours must follow
+  } else {
+    displayH = (displayH + 1) % 24;   // hours go up
+  }
+  scoring    = 'none';
+  flash.side = side;
+  flash.t    = flash.MAX;
+  resetTimer = 95;       // ~1.6 s at 60 fps
+  trail      = [];
+}
+
+// ── Draw ───────────────────────────────────────────────────────────────────
+function draw() {
+  // Background
+  X.fillStyle = BG;
+  X.fillRect(0, 0, W, H);
+
+  // ── Score-side flash ─────────────────────────────────────────────────────
+  if (flash.t > 0) {
+    const pct = flash.t / flash.MAX;
+    X.fillStyle = P_TRACE + (pct * pct * 0.12) + ')';
+    if (flash.side === 'left')  X.fillRect(0,     0, W / 2, H);
+    else                        X.fillRect(W / 2, 0, W / 2, H);
+  }
+
+  drawNet();
+
+  // ── Ball trail ───────────────────────────────────────────────────────────
+  if (resetTimer === 0) {
+    trail.forEach((p, i) => {
+      const maxAge = 14;
+      const a = Math.max(0, (1 - p.age / maxAge)) * 0.3;
+      const r = BR() * 0.65 * ((i + 1) / trail.length);
+      X.fillStyle = P_TRACE + a + ')';
+      X.beginPath();
+      X.arc(p.x, p.y, r, 0, Math.PI * 2);
+      X.fill();
+    });
+  }
+
+  drawBall();
+  drawPaddle(lp);
+  drawPaddle(rp);
+  drawScore();
+}
+
+function drawNet() {
+  const dh  = H * 0.026;
+  const gap = H * 0.017;
+  X.fillStyle = P;
+  for (let y = 0; y < H; y += dh + gap) {
+    X.fillRect(W / 2 - 1.5, y, 3, dh);
+  }
+}
+
+function drawBall() {
+  if (resetTimer > 0) return;
+  const r = BR();
+  X.fillStyle = P;
+  X.fillRect(ball.x - r, ball.y - r, r * 2, r * 2);
+}
+
+function drawPaddle(p) {
+  X.fillStyle = P;
+  X.fillRect(p.x, p.y, PW(), PH());
+}
+
+function drawDigit(ch, x, y, ps, gap) {
+  const bits = DIGITS[ch];
+  if (!bits) return;
+  const step = ps + gap;
+  for (let row = 0; row < 5; row++) {
+    for (let col = 0; col < 3; col++) {
+      if (bits[row * 3 + col]) {
+        X.fillRect(Math.floor(x) + col * step, Math.floor(y) + row * step, ps, ps);
+      }
+    }
+  }
+}
+
+function drawScore() {
+  const hh = String(displayH).padStart(2, '0');
+  const mm = String(displayM).padStart(2, '0');
+
+  const ps      = Math.floor(Math.min(W * 0.022, H * 0.038));  // one block size (integer to avoid sub-pixel gaps)
+  const gap     = 0;                                 // blocks joined flush
+  const step    = ps + gap;
+  const digitW  = 3 * step - gap;                   // pixel width of one digit
+  const spacing = step * 1.5;                       // gap between two digits in a pair
+  const margin  = step * 2;                         // distance from centre line
+  const top     = H * 0.05;
+
+  X.fillStyle = P;
+
+  // Hours — right pair, flush left of centre
+  drawDigit(hh[0], W/2 - margin - digitW*2 - spacing, top, ps, gap);
+  drawDigit(hh[1], W/2 - margin - digitW,             top, ps, gap);
+
+  // Minutes — left pair, flush right of centre
+  drawDigit(mm[0], W/2 + margin,             top, ps, gap);
+  drawDigit(mm[1], W/2 + margin + digitW + spacing, top, ps, gap);
+}
+
+// ── Main loop ──────────────────────────────────────────────────────────────
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// ── Bootstrap ──────────────────────────────────────────────────────────────
+window.addEventListener('resize', () => {
+  resize();
+  // Keep paddles inside bounds after resize
+  lp.y = clamp(lp.y, 0, H - PH());
+  rp.y = clamp(rp.y, 0, H - PH());
+});
+
+placePaddles();
+lp.y = H / 2 - PH() / 2;
+rp.y = H / 2 - PH() / 2;
+
+const _t = getNow();
+displayH = _t.h;
+displayM = _t.m;
+
+launchBall(Math.random() > 0.5 ? 'left' : 'right');
+loop();
+</script>
+</body>
+</html>
